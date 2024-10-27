@@ -9,9 +9,11 @@ import (
 	"compress/gzip"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/felixge/httpsnoop"
+	"github.com/klauspost/compress/zstd"
 )
 
 const acceptEncoding string = "Accept-Encoding"
@@ -55,8 +57,9 @@ func (cw *compressResponseWriter) Flush() {
 	}
 }
 
-// CompressHandler gzip compresses HTTP responses for clients that support it
-// via the 'Accept-Encoding' header.
+// CompressHandler zstd compresses HTTP responses for clients that support it
+// via the 'Accept-Encoding' header. If zstd is not supported, it will fall back
+// to gzip or flate compression.
 //
 // Compressing TLS traffic may leak the page contents to an attacker if the
 // page contains user input: http://security.stackexchange.com/a/102015/12208
@@ -78,17 +81,24 @@ func CompressHandlerLevel(h http.Handler, level int) http.Handler {
 	const (
 		gzipEncoding  = "gzip"
 		flateEncoding = "deflate"
+		zstdEncoding  = "zstd"
 	)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// detect what encoding to use
 		var encoding string
-		for _, curEnc := range strings.Split(r.Header.Get(acceptEncoding), ",") {
-			curEnc = strings.TrimSpace(curEnc)
-			if curEnc == gzipEncoding || curEnc == flateEncoding {
-				encoding = curEnc
-				break
-			}
+		encodings := strings.Split(r.Header.Get(acceptEncoding), ",")
+		for i := range encodings {
+			encodings[i] = strings.TrimSpace(encodings[i])
+		}
+
+		// zstd > gzip > flate
+		if slices.Contains(encodings, zstdEncoding) {
+			encoding = zstdEncoding
+		} else if slices.Contains(encodings, gzipEncoding) {
+			encoding = gzipEncoding
+		} else if slices.Contains(encodings, flateEncoding) {
+			encoding = flateEncoding
 		}
 
 		// always add Accept-Encoding to Vary to prevent intermediate caches corruption
@@ -108,7 +118,17 @@ func CompressHandlerLevel(h http.Handler, level int) http.Handler {
 
 		// wrap the ResponseWriter with the writer for the chosen encoding
 		var encWriter io.WriteCloser
-		if encoding == gzipEncoding {
+		if encoding == zstdEncoding {
+			// Map gzip compression levels to zstd compression levels
+			zstdSpeed := zstd.SpeedDefault
+			if level == gzip.BestSpeed {
+				zstdSpeed = zstd.SpeedFastest
+			} else if level == gzip.BestCompression {
+				zstdSpeed = zstd.SpeedBestCompression
+			}
+
+			encWriter, _ = zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.EncoderLevel(zstdSpeed)))
+		} else if encoding == gzipEncoding {
 			encWriter, _ = gzip.NewWriterLevel(w, level)
 		} else if encoding == flateEncoding {
 			encWriter, _ = flate.NewWriter(w, level)
